@@ -64,6 +64,7 @@
 #define ST_POWER_SAVING		BIT(1)
 #define ST_SDRAM_READY		BIT(2)
 #define ST_CORE_BUSY		BIT(3)
+#define ST_WR_FIFO_EMPTY	BIT(6)
 #define ST_WR_FIFO_FULL		BIT(7)
 
 /* Registers (names from the LT768x datasheet / EastRising library) */
@@ -116,6 +117,10 @@ static int pclk_edge = -1;
 module_param(pclk_edge, int, 0644);
 MODULE_PARM_DESC(pclk_edge, "Force PCLK edge: 0 or 1 (DPCR bit7), -1 = from DT (default)");
 
+static bool pageflip = true;
+module_param(pageflip, bool, 0644);
+MODULE_PARM_DESC(pageflip, "Double-buffer in SDRAM and flip the display start address (default 1)");
+
 static unsigned int sclk_mhz;
 module_param(sclk_mhz, uint, 0644);
 MODULE_PARM_DESC(sclk_mhz, "Override pixel clock PLL N (MHz), 0 = from mode (default)");
@@ -139,6 +144,10 @@ struct lt7680 {
 	struct drm_display_mode mode;
 	bool hsync_high, vsync_high, de_low, pclk_inv;
 	u16 pll_n_sclk;
+
+	bool pageflip;			/* two SDRAM pages, flipped on update */
+	unsigned int front;		/* page currently scanned out (0/1) */
+	struct drm_rect prev;		/* region the back page is stale in */
 
 	u8 *txbuf;			/* [0x80][pixel stream...] */
 	size_t chunk;			/* payload bytes per SPI message */
@@ -504,9 +513,49 @@ static void lt_fb_dirty(struct lt7680 *lt, struct drm_framebuffer *fb,
 		return;
 	if (map->is_iomem)
 		return;
-	ret = lt_blit(lt, fb, map->vaddr, rect);
-	if (ret)
-		drm_err_once(&lt->drm, "frame transfer failed: %d\n", ret);
+
+	if (!lt->pageflip) {
+		ret = lt_blit(lt, fb, map->vaddr, rect);
+		if (ret)
+			drm_err_once(&lt->drm, "frame transfer failed: %d\n", ret);
+		return;
+	}
+
+	/*
+	 * Double buffering: the back page is stale in the region that was
+	 * damaged last time, so rewrite damage + previous damage there, wait
+	 * for the chip to drain its write FIFO, then flip the scan-out address.
+	 */
+	{
+		struct drm_rect dmg = *rect, u = *rect;
+		unsigned int back = lt->front ^ 1;
+		u32 page = lt->mode.hdisplay * lt->mode.vdisplay * 2;
+
+		if (drm_rect_visible(&lt->prev)) {
+			u.x1 = min(u.x1, lt->prev.x1);
+			u.y1 = min(u.y1, lt->prev.y1);
+			u.x2 = max(u.x2, lt->prev.x2);
+			u.y2 = max(u.y2, lt->prev.y2);
+		}
+
+		lt->err = 0;
+		lt_wr32(lt, R_CVSSA0, back * page);
+		ret = lt_blit(lt, fb, map->vaddr, &u);
+		if (!ret)
+			ret = lt_wait_status(lt, ST_WR_FIFO_EMPTY, true, 100);
+		if (!ret) {
+			lt_wr32(lt, R_MISA0, back * page);
+			ret = lt->err;
+		}
+		if (ret) {
+			drm_err_once(&lt->drm, "frame transfer failed: %d\n", ret);
+			/* unknown state: rewrite everything next time */
+			lt->prev = full;
+			return;
+		}
+		lt->front = back;
+		lt->prev = dmg;
+	}
 }
 
 /* ------------------------------------------------------------------ KMS side */
@@ -736,6 +785,7 @@ static int lt7680_probe(struct spi_device *spi)
 #endif
 	lt->spi = spi;
 	lt->panel = of_device_get_match_data(dev);
+	lt->pageflip = pageflip;
 
 	lt->reset = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(lt->reset))

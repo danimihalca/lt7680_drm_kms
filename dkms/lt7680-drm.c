@@ -460,6 +460,42 @@ static void lt_convert_row(u16 *dst, const void *src, unsigned int w, u32 format
 	}
 }
 
+/*
+ * On-chip BTE memory copy (ROP 0x0C = source 0, op 0x02), 16bpp, same
+ * register sequence as the EastRising tutorial. Used to bring the hidden
+ * page back in sync after a flip without sending pixels over SPI.
+ */
+static int lt_bte_copy_rect(struct lt7680 *lt, u32 src, u32 dst,
+			    const struct drm_rect *r)
+{
+	u16 W = lt->mode.hdisplay;
+
+	lt->err = 0;
+	lt_upd(lt, 0x92, BIT(6), BIT(5));		/* S0 16bpp */
+	lt_upd(lt, 0x92, BIT(4) | BIT(3), BIT(2));	/* S1 16bpp */
+	lt_upd(lt, 0x92, BIT(1), BIT(0));		/* dest 16bpp */
+	lt_wr32(lt, 0x93, src);
+	lt_wr16(lt, 0x97, W);
+	lt_wr16(lt, 0x99, r->x1);
+	lt_wr16(lt, 0x9b, r->y1);
+	lt_wr32(lt, 0x9d, src);				/* S1 unused with ROP 0x0C */
+	lt_wr16(lt, 0xa1, W);
+	lt_wr16(lt, 0xa3, r->x1);
+	lt_wr16(lt, 0xa5, r->y1);
+	lt_wr32(lt, 0xa7, dst);
+	lt_wr16(lt, 0xab, W);
+	lt_wr16(lt, 0xad, r->x1);
+	lt_wr16(lt, 0xaf, r->y1);
+	lt_wr16(lt, 0xb1, drm_rect_width(r));
+	lt_wr16(lt, 0xb3, drm_rect_height(r));
+	lt_upd(lt, 0x91, 0xf0, 0xc0);			/* ROP 0x0C */
+	lt_upd(lt, 0x91, 0x0f, 0x02);			/* memory copy with ROP */
+	lt_upd(lt, 0x90, 0, BIT(4));			/* start BTE */
+	if (lt->err)
+		return lt->err;
+	return lt_wait_status(lt, ST_CORE_BUSY, false, 200);
+}
+
 static int lt_blit(struct lt7680 *lt, struct drm_framebuffer *fb, const void *vaddr,
 		   const struct drm_rect *clip)
 {
@@ -555,6 +591,10 @@ static void lt_fb_dirty(struct lt7680 *lt, struct drm_framebuffer *fb,
 		}
 		lt->front = back;
 		lt->prev = dmg;
+
+		/* sync the old page (now hidden) from the new front on-chip */
+		if (!lt_bte_copy_rect(lt, back * page, (back ^ 1) * page, &dmg))
+			lt->prev = (struct drm_rect){ 0 };
 	}
 }
 

@@ -19,6 +19,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
 #include <linux/iosys-map.h>
 #include <linux/ktime.h>
@@ -42,7 +43,14 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#if __has_include(<drm/clients/drm_client_setup.h>)
+#include <drm/clients/drm_client_setup.h>
+#else
+#include <drm/drm_client_setup.h>
+#endif
+#include <drm/drm_fbdev_dma.h>
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 #include <drm/drm_fbdev_dma.h>
 #else
 #include <drm/drm_fbdev_generic.h>
@@ -602,6 +610,9 @@ static const struct drm_driver lt_drm_driver = {
 	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.fops = &lt_fops,
 	DRM_GEM_DMA_DRIVER_OPS,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+	DRM_FBDEV_DMA_DRIVER_OPS,
+#endif
 	.name = "lt7680",
 	.desc = "Levetop LT7680 SPI display",
 	.major = 1,
@@ -695,10 +706,26 @@ static int lt7680_probe(struct spi_device *spi)
 	size_t maxx;
 	int ret;
 
+	/*
+	 * An spi_device has no DMA mask, so GEM DMA allocations (fbdev
+	 * dumb buffer) fail with -ENOMEM. Give it a valid mask and, on
+	 * newer kernels, allocate from the SPI controller's DMA-capable
+	 * parent device instead.
+	 */
+	if (!dev->dma_mask)
+		dev->dma_mask = &dev->coherent_dma_mask;
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	if (ret)
+		return ret;
+
 	lt = devm_drm_dev_alloc(dev, &lt_drm_driver, struct lt7680, drm);
 	if (IS_ERR(lt))
 		return PTR_ERR(lt);
 	drm = &lt->drm;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+	if (spi->controller->dev.parent)
+		drm_dev_set_dma_dev(drm, spi->controller->dev.parent);
+#endif
 	lt->spi = spi;
 	lt->panel = of_device_get_match_data(dev);
 
@@ -781,7 +808,9 @@ static int lt7680_probe(struct spi_device *spi)
 		return ret;
 
 	spi_set_drvdata(spi, drm);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+	drm_client_setup_with_fourcc(drm, DRM_FORMAT_RGB565);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 	drm_fbdev_dma_setup(drm, 16);
 #else
 	drm_fbdev_generic_setup(drm, 16);

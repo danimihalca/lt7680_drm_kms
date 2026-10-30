@@ -112,6 +112,14 @@ static unsigned int fifo_poll = 1;
 module_param(fifo_poll, uint, 0644);
 MODULE_PARM_DESC(fifo_poll, "Poll the write FIFO status between SPI chunks (default 1)");
 
+static int pclk_edge = -1;
+module_param(pclk_edge, int, 0644);
+MODULE_PARM_DESC(pclk_edge, "Force PCLK edge: 0 or 1 (DPCR bit7), -1 = from DT (default)");
+
+static unsigned int sclk_mhz;
+module_param(sclk_mhz, uint, 0644);
+MODULE_PARM_DESC(sclk_mhz, "Override pixel clock PLL N (MHz), 0 = from mode (default)");
+
 struct lt7680_panel_cfg {
 	const u8 (*init)[2];
 	unsigned int n_init;
@@ -677,7 +685,7 @@ static int lt_parse_timing(struct lt7680 *lt, struct device *dev)
 	lt->hsync_high = hs;
 	lt->vsync_high = vs;
 	lt->de_low = !de;
-	lt->pclk_inv = pc;		/* DPCR bit 7: 0 = tutorial default */
+	lt->pclk_inv = pclk_edge >= 0 ? !!pclk_edge : pc;	/* DPCR bit 7 */
 
 	of_property_read_u32(dev->of_node, "width-mm", &w_mm);
 	of_property_read_u32(dev->of_node, "height-mm", &h_mm);
@@ -690,7 +698,7 @@ static int lt_parse_timing(struct lt7680 *lt, struct device *dev)
 	}
 
 	/* Fout(SCLK) = N MHz with the fixed XI = 10 MHz, R = 5, OD = 2 setup */
-	lt->pll_n_sclk = DIV_ROUND_CLOSEST(m->clock, 1000);
+	lt->pll_n_sclk = sclk_mhz ? sclk_mhz : DIV_ROUND_CLOSEST(m->clock, 1000);
 	if (lt->pll_n_sclk < 1 || lt->pll_n_sclk > 511)
 		ret = dev_err_probe(dev, -EINVAL, "pixel clock %d kHz out of range\n", m->clock);
 out:
